@@ -5,7 +5,8 @@ compared over time; nothing is ever overwritten.
 
     conn = init_db("auditor.db")
     run_id = save_run(conn, domain="example.com", results=results,
-                      started_at=..., finished_at=..., max_pages=50)
+                      started_at=..., finished_at=..., max_pages=50,
+                      start_url="https://example.com/")
     get_runs(conn)            # newest first
     get_pages(conn, run_id)   # in visit order
     get_findings(conn, page_id)
@@ -13,6 +14,16 @@ compared over time; nothing is ever overwritten.
 
 Timestamps are ISO 8601 strings in UTC, so they sort correctly as text.
 Query helpers return plain dicts.
+
+Scores (see `auditor.scoring`) are computed when a run is saved: each audited
+page gets `pages.score` (0–100; NULL for pages that failed to load) and the run
+gets `audit_runs.site_score` (average page score; NULL if no page has one).
+
+Schema versions (stored in `PRAGMA user_version`):
+  1. initial schema
+  2. adds pages.score, audit_runs.site_score and audit_runs.start_url;
+     migrating a version 1 database computes scores for its existing runs
+     (start_url stays NULL for them, as it was never recorded)
 """
 
 from __future__ import annotations
@@ -22,9 +33,10 @@ import sqlite3
 from collections.abc import Iterable, Iterator
 from os import PathLike
 
+from auditor import scoring
 from auditor.audit import AuditResult, Finding
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 RUN_STATUSES = ("completed", "failed")
 
@@ -41,7 +53,9 @@ CREATE TABLE IF NOT EXISTS audit_runs (
     started_at  TEXT NOT NULL,
     finished_at TEXT,
     max_pages   INTEGER NOT NULL CHECK (max_pages >= 1),
-    status      TEXT NOT NULL CHECK (status IN ('completed', 'failed'))
+    status      TEXT NOT NULL CHECK (status IN ('completed', 'failed')),
+    start_url   TEXT,
+    site_score  REAL
 );
 CREATE INDEX IF NOT EXISTS idx_audit_runs_site ON audit_runs(site_id, started_at);
 
@@ -53,6 +67,7 @@ CREATE TABLE IF NOT EXISTS pages (
     status        TEXT NOT NULL CHECK (status IN ('ok', 'error')),
     error_message TEXT,
     audited_at    TEXT NOT NULL,
+    score         INTEGER CHECK (score BETWEEN 0 AND 100),
     CHECK ((status = 'ok') = (error_message IS NULL))
 );
 CREATE INDEX IF NOT EXISTS idx_pages_run ON pages(run_id);
@@ -107,6 +122,11 @@ def init_db(path: str | PathLike) -> sqlite3.Connection:
                 f"up to {SCHEMA_VERSION}"
             )
         with _transaction(conn):
+            # Upgrade existing databases first, one version at a time; a new
+            # (version 0) database gets the current schema directly below.
+            if version >= 1:
+                for v in range(version, SCHEMA_VERSION):
+                    _MIGRATIONS[v](conn)
             for statement in _SCHEMA.split(";"):
                 if statement.strip():
                     conn.execute(statement)
@@ -115,6 +135,27 @@ def init_db(path: str | PathLike) -> sqlite3.Connection:
         conn.close()
         raise
     return conn
+
+
+def _migrate_1_to_2(conn: sqlite3.Connection) -> None:
+    """Add score columns and start_url, then score the runs already stored."""
+    conn.execute("ALTER TABLE pages ADD COLUMN score INTEGER"
+                 " CHECK (score BETWEEN 0 AND 100)")
+    conn.execute("ALTER TABLE audit_runs ADD COLUMN start_url TEXT")
+    conn.execute("ALTER TABLE audit_runs ADD COLUMN site_score REAL")
+    for (page_id,) in conn.execute("SELECT id FROM pages WHERE status = 'ok'").fetchall():
+        conn.execute("UPDATE pages SET score = ? WHERE id = ?",
+                     (scoring.score_page(get_findings(conn, page_id)), page_id))
+    for (run_id,) in conn.execute("SELECT id FROM audit_runs").fetchall():
+        page_scores = conn.execute(
+            "SELECT url, score FROM pages WHERE run_id = ? ORDER BY id", (run_id,)
+        ).fetchall()
+        conn.execute("UPDATE audit_runs SET site_score = ? WHERE id = ?",
+                     (scoring.score_site(page_scores).score, run_id))
+
+
+# _MIGRATIONS[v] upgrades a database from schema version v to v + 1.
+_MIGRATIONS = {1: _migrate_1_to_2}
 
 
 @contextlib.contextmanager
@@ -169,13 +210,18 @@ def save_run(
     max_pages: int,
     status: str = "completed",
     name: str | None = None,
+    start_url: str | None = None,
 ) -> int:
     """Save one crawl as a new audit run, all in a single transaction.
 
     `results` are the crawler's per-page results, in visit order: an
     `AuditResult` for an audited page, or anything with `.url` and `.error`
     (a `crawler.PageError`) for a page that failed. Each may carry an
-    `audited_at` timestamp; otherwise `finished_at` is used.
+    `audited_at` timestamp; otherwise `finished_at` is used. `start_url` is
+    the URL the crawl started from.
+
+    Each audited page is scored with `scoring.score_page`, and the run with
+    `scoring.score_site`.
 
     If anything fails, nothing is saved (not even a new site) and the error
     is re-raised. Returns the new run's id.
@@ -186,18 +232,22 @@ def save_run(
     with _transaction(conn):
         site_id = _site_id(conn, domain, name)
         run_id = conn.execute(
-            "INSERT INTO audit_runs (site_id, started_at, finished_at, max_pages, status)"
-            " VALUES (?, ?, ?, ?, ?)",
-            (site_id, started_at, finished_at, max_pages, status),
+            "INSERT INTO audit_runs"
+            " (site_id, started_at, finished_at, max_pages, status, start_url)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (site_id, started_at, finished_at, max_pages, status, start_url),
         ).lastrowid
 
+        page_scores = []
         for result in results:
             audited_at = getattr(result, "audited_at", None) or finished_at or started_at
             if isinstance(result, AuditResult):
+                score = scoring.score_page(result)
+                page_scores.append((result.url, score))
                 page_id = conn.execute(
-                    "INSERT INTO pages (run_id, url, title, status, audited_at)"
-                    " VALUES (?, ?, ?, 'ok', ?)",
-                    (run_id, result.url, result.title, audited_at),
+                    "INSERT INTO pages (run_id, url, title, status, audited_at, score)"
+                    " VALUES (?, ?, ?, 'ok', ?, ?)",
+                    (run_id, result.url, result.title, audited_at, score),
                 ).lastrowid
                 _save_findings(conn, page_id, "violation", result.violations)
                 _save_findings(conn, page_id, "needs_review", result.needs_review)
@@ -207,6 +257,9 @@ def save_run(
                     " VALUES (?, ?, 'error', ?, ?)",
                     (run_id, result.url, result.error, audited_at),
                 )
+
+        conn.execute("UPDATE audit_runs SET site_score = ? WHERE id = ?",
+                     (scoring.score_site(page_scores).score, run_id))
     return run_id
 
 
@@ -223,6 +276,7 @@ def get_runs(conn: sqlite3.Connection, domain: str | None = None) -> list[dict]:
     sql = """
         SELECT r.id, r.site_id, s.domain, s.name AS site_name,
                r.started_at, r.finished_at, r.max_pages, r.status,
+               r.start_url, r.site_score,
                COUNT(p.id) AS page_count,
                COALESCE(SUM(p.status = 'error'), 0) AS error_count
         FROM audit_runs r
@@ -238,11 +292,12 @@ def get_runs(conn: sqlite3.Connection, domain: str | None = None) -> list[dict]:
 
 
 def get_pages(conn: sqlite3.Connection, run_id: int) -> list[dict]:
-    """Pages of a run in visit order, with how many violations and
-    needs-review findings (rules, not elements) each has."""
+    """Pages of a run in visit order, with their score and how many
+    violations and needs-review findings (rules, not elements) each has."""
     return _dicts(conn.execute(
         """
         SELECT p.id, p.run_id, p.url, p.title, p.status, p.error_message, p.audited_at,
+               p.score,
                COALESCE(SUM(f.kind = 'violation'), 0) AS violation_count,
                COALESCE(SUM(f.kind = 'needs_review'), 0) AS needs_review_count
         FROM pages p

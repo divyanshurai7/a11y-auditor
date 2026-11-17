@@ -365,6 +365,8 @@ def test_cli_saves_each_crawl_as_a_new_run(site_server, tmp_path):
         assert {r["domain"] for r in runs} == {site_domain(site_server.url)}
         assert all(r["status"] == "completed" and r["max_pages"] == 4 for r in runs)
         assert all(r["started_at"] <= r["finished_at"] for r in runs)
+        assert {r["start_url"] for r in runs} == {f"{site_server.url}/index.html"}
+        assert all(r["site_score"] is not None for r in runs)
 
         pages = db.get_pages(conn, 1)
         assert [p["url"] for p in pages] == [

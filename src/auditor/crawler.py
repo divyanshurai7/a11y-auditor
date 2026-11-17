@@ -346,7 +346,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             run_id = db.save_run(conn, domain=site_domain(args.url), results=results,
                                  started_at=started_at, finished_at=finished_at,
-                                 max_pages=args.max_pages)
+                                 max_pages=args.max_pages, start_url=args.url)
         finally:
             conn.close()
     except (sqlite3.Error, RuntimeError) as exc:

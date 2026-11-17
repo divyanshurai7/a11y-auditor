@@ -126,6 +126,7 @@ def test_save_run_stores_whole_crawl(conn):
         "id": run_id, "site_id": run["site_id"], "domain": "example.com",
         "site_name": "example.com", "started_at": T0, "finished_at": T1,
         "max_pages": 10, "status": "completed", "page_count": 3, "error_count": 1,
+        "start_url": None, "site_score": 84.5,
     }
     assert _table_counts(conn) == {"sites": 1, "audit_runs": 1, "pages": 3,
                                    "findings": 4, "finding_nodes": 5}
@@ -323,3 +324,136 @@ def test_finding_without_nodes_is_counted_with_zero_nodes(conn):
     run_id = _save(conn, [result])
     [row] = db.rule_counts(conn, run_id)
     assert (row["rule_id"], row["page_count"], row["node_count"]) == ("document-title", 1, 0)
+
+
+# --- scores and start_url (schema version 2) ---------------------------------
+
+
+def test_save_run_stores_page_and_site_scores(conn):
+    run_id = _save(conn)
+    pages = db.get_pages(conn, run_id)
+    # Home: image-alt serious x2 (8 + 0.5) + label critical (15) = 23.5 off -> 77.
+    # About: image-alt serious x1 = 8 off -> 92. The 404 page has no score.
+    assert [p["score"] for p in pages] == [77, 92, None]
+    assert db.get_runs(conn)[0]["site_score"] == 84.5
+
+
+def test_site_score_is_null_without_audited_pages(conn):
+    _save(conn, [PageError(url="https://example.com/", error="timeout")])
+    assert db.get_runs(conn)[0]["site_score"] is None
+
+
+def test_save_run_stores_start_url(conn):
+    _save(conn, start_url="https://example.com/start")
+    assert db.get_runs(conn)[0]["start_url"] == "https://example.com/start"
+
+
+def test_score_must_be_between_0_and_100(conn):
+    run_id = _save(conn)
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("UPDATE pages SET score = 101 WHERE run_id = ?", (run_id,))
+
+
+# The schema exactly as version 1 created it.
+_V1_SCHEMA = """
+CREATE TABLE sites (id INTEGER PRIMARY KEY, domain TEXT NOT NULL UNIQUE, name TEXT NOT NULL);
+CREATE TABLE audit_runs (
+    id INTEGER PRIMARY KEY,
+    site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+    started_at TEXT NOT NULL, finished_at TEXT,
+    max_pages INTEGER NOT NULL CHECK (max_pages >= 1),
+    status TEXT NOT NULL CHECK (status IN ('completed', 'failed')));
+CREATE INDEX idx_audit_runs_site ON audit_runs(site_id, started_at);
+CREATE TABLE pages (
+    id INTEGER PRIMARY KEY,
+    run_id INTEGER NOT NULL REFERENCES audit_runs(id) ON DELETE CASCADE,
+    url TEXT NOT NULL, title TEXT,
+    status TEXT NOT NULL CHECK (status IN ('ok', 'error')),
+    error_message TEXT, audited_at TEXT NOT NULL,
+    CHECK ((status = 'ok') = (error_message IS NULL)));
+CREATE INDEX idx_pages_run ON pages(run_id);
+CREATE INDEX idx_pages_url ON pages(url);
+CREATE TABLE findings (
+    id INTEGER PRIMARY KEY,
+    page_id INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL CHECK (kind IN ('violation', 'needs_review')),
+    rule_id TEXT NOT NULL, impact TEXT, description TEXT NOT NULL, help_url TEXT NOT NULL);
+CREATE INDEX idx_findings_page ON findings(page_id);
+CREATE INDEX idx_findings_rule ON findings(rule_id);
+CREATE TABLE finding_nodes (
+    id INTEGER PRIMARY KEY,
+    finding_id INTEGER NOT NULL REFERENCES findings(id) ON DELETE CASCADE,
+    selector TEXT NOT NULL, html TEXT NOT NULL);
+CREATE INDEX idx_finding_nodes_finding ON finding_nodes(finding_id);
+
+INSERT INTO sites VALUES (1, 'example.com', 'example.com');
+INSERT INTO audit_runs VALUES (1, 1, '2026-01-01T10:00:00Z', '2026-01-01T10:00:05Z', 10, 'completed');
+INSERT INTO audit_runs VALUES (2, 1, '2026-01-02T10:00:00Z', '2026-01-02T10:00:05Z', 10, 'failed');
+INSERT INTO pages VALUES (1, 1, 'https://example.com/', 'Home', 'ok', NULL, '2026-01-01T10:00:01Z');
+INSERT INTO pages VALUES (2, 1, 'https://example.com/about', 'About', 'ok', NULL, '2026-01-01T10:00:02Z');
+INSERT INTO pages VALUES (3, 1, 'https://example.com/x', NULL, 'error', '404', '2026-01-01T10:00:03Z');
+INSERT INTO pages VALUES (4, 2, 'https://example.com/', NULL, 'error', 'timeout', '2026-01-02T10:00:01Z');
+INSERT INTO findings VALUES (1, 1, 'violation', 'image-alt', 'serious', 'd', 'u');
+INSERT INTO findings VALUES (2, 1, 'violation', 'label', 'critical', 'd', 'u');
+INSERT INTO findings VALUES (3, 1, 'needs_review', 'color-contrast', 'serious', 'd', 'u');
+INSERT INTO finding_nodes VALUES (1, 1, '#logo', '<img>');
+INSERT INTO finding_nodes VALUES (2, 1, '#hero', '<img>');
+INSERT INTO finding_nodes VALUES (3, 2, '#email', '<input>');
+INSERT INTO finding_nodes VALUES (4, 3, '.banner', '<p>');
+PRAGMA user_version = 1;
+"""
+
+
+def _columns(conn, table):
+    return [r["name"] for r in conn.execute(f"PRAGMA table_info({table})")]
+
+
+def test_migrates_version_1_database(tmp_path):
+    path = tmp_path / "v1.db"
+    raw = sqlite3.connect(path)
+    raw.executescript(_V1_SCHEMA)
+    raw.close()
+
+    conn = db.init_db(path)
+    try:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert "score" in _columns(conn, "pages")
+        assert {"site_score", "start_url"} <= set(_columns(conn, "audit_runs"))
+
+        # Existing data is kept and scored.
+        assert [p["score"] for p in db.get_pages(conn, 1)] == [77, 100, None]
+        runs = {r["id"]: r for r in db.get_runs(conn)}
+        assert runs[1]["site_score"] == 88.5
+        assert runs[2]["site_score"] is None  # no audited pages
+        assert runs[1]["start_url"] is None  # never recorded in version 1
+        assert len(db.get_findings(conn, 1)) == 3
+
+        # New runs save normally into the migrated database.
+        run_id = _save(conn, start_url="https://example.com/")
+        assert [p["score"] for p in db.get_pages(conn, run_id)] == [77, 92, None]
+    finally:
+        conn.close()
+
+    # Opening again doesn't try to migrate twice.
+    db.init_db(path).close()
+
+
+def test_failed_migration_leaves_version_1_database_untouched(tmp_path, monkeypatch):
+    path = tmp_path / "v1.db"
+    raw = sqlite3.connect(path)
+    raw.executescript(_V1_SCHEMA)
+    raw.close()
+
+    def boom(findings):
+        raise RuntimeError("scoring failed")
+
+    monkeypatch.setattr(db.scoring, "score_page", boom)
+    with pytest.raises(RuntimeError, match="scoring failed"):
+        db.init_db(path)
+
+    raw = sqlite3.connect(path)
+    try:
+        assert raw.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert "score" not in [r[1] for r in raw.execute("PRAGMA table_info(pages)")]
+    finally:
+        raw.close()
