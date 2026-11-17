@@ -2,9 +2,10 @@
 
 Usage from the command line::
 
-    python -m auditor.crawler <url> [--max-pages N] [--delay S] [--output FILE]
+    python -m auditor.crawler <url> [--max-pages N] [--delay S] [--output FILE] [--db FILE]
 
-prints progress to stderr and writes the results to a JSON file.
+prints progress to stderr, writes the results to a JSON file, and saves them as
+a new audit run in a SQLite database (earlier runs are kept for comparison).
 
 Etiquette: stays on the start URL's site (www. and the bare domain count as the
 same), obeys robots.txt (including Crawl-delay), waits between requests, and
@@ -16,16 +17,18 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import sqlite3
 import sys
 import time
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import PurePosixPath
 from typing import Callable
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from urllib.robotparser import RobotFileParser
 
-from auditor.audit import DEFAULT_TIMEOUT_MS, AuditError, Auditor, AuditResult
+from auditor import db
+from auditor.audit import DEFAULT_TIMEOUT_MS, AuditError, Auditor, AuditResult, utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +73,8 @@ class PageError:
 
     url: str
     error: str
+    # When the attempt failed (UTC, ISO 8601).
+    audited_at: str = field(default_factory=utc_now)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -125,6 +130,15 @@ def normalize_url(url: str) -> str:
     if parts.port is not None:  # clean_url already dropped default ports
         netloc += f":{parts.port}"
     return urlunsplit((parts.scheme, netloc, path, parts.query, ""))
+
+
+def site_domain(url: str) -> str:
+    """The site a URL belongs to, as stored in the database: host without
+    www., plus the port if it isn't the scheme's default."""
+    parts = urlsplit(clean_url(url))
+    host = _site_key(parts.hostname)
+    netloc = f"[{host}]" if ":" in host else host
+    return f"{netloc}:{parts.port}" if parts.port is not None else netloc
 
 
 def same_site(url: str, site: str) -> bool:
@@ -301,6 +315,8 @@ def main(argv: list[str] | None = None) -> int:
                         help=f"page load timeout in milliseconds (default {DEFAULT_TIMEOUT_MS})")
     parser.add_argument("-o", "--output", default="crawl_results.json",
                         help="JSON file to write results to (default crawl_results.json)")
+    parser.add_argument("--db", default="auditor.db",
+                        help="SQLite database to save the run to (default auditor.db)")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s",
@@ -309,12 +325,14 @@ def main(argv: list[str] | None = None) -> int:
     def show_progress(n: int, total: int, url: str) -> None:
         print(f"[{n}/{total}] {url}", file=sys.stderr, flush=True)
 
+    started_at = utc_now()
     try:
         results = crawl(args.url, max_pages=args.max_pages, delay=args.delay,
                         timeout_ms=args.timeout, progress=show_progress)
     except (ValueError, AuditError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    finished_at = utc_now()
 
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump([r.to_dict() for r in results], f, indent=2)
@@ -322,6 +340,20 @@ def main(argv: list[str] | None = None) -> int:
     failed = sum(isinstance(r, PageError) for r in results)
     print(f"Visited {len(results)} page(s), {failed} failed. Results written to {args.output}",
           file=sys.stderr)
+
+    try:
+        conn = db.init_db(args.db)
+        try:
+            run_id = db.save_run(conn, domain=site_domain(args.url), results=results,
+                                 started_at=started_at, finished_at=finished_at,
+                                 max_pages=args.max_pages)
+        finally:
+            conn.close()
+    except (sqlite3.Error, RuntimeError) as exc:
+        print(f"error: could not save to {args.db}: {exc}", file=sys.stderr)
+        return 1
+    print(f"Saved as run {run_id} in {args.db}", file=sys.stderr)
+
     return 0 if len(results) > failed else 1
 
 

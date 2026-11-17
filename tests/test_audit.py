@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from datetime import datetime
 
 import pytest
 
@@ -82,7 +83,8 @@ def test_undecidable_problem_goes_to_needs_review(fixture_server):
 def test_result_shape_is_json_serialisable(fixture_server, page, key):
     result = audit_page(f"{fixture_server}/{page}")
     data = json.loads(json.dumps(result.to_dict()))
-    assert set(data) == {"url", "title", "violations", "needs_review"}
+    assert set(data) == {"url", "title", "violations", "needs_review", "audited_at"}
+    assert datetime.fromisoformat(data["audited_at"]).tzinfo is not None  # UTC timestamp
     assert set(data[key][0]) == {"rule_id", "impact", "description", "help_url", "nodes"}
     assert set(data[key][0]["nodes"][0]) == {"selector", "html"}
 

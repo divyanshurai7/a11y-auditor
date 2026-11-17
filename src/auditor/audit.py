@@ -13,6 +13,7 @@ import argparse
 import json
 import sys
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 
 from axe_playwright_python.base import AXE_SCRIPT
 from playwright.sync_api import Error as PlaywrightError
@@ -32,6 +33,11 @@ DEFAULT_TIMEOUT_MS = 30_000
 # After the "load" event, give late network activity (XHR, lazy assets) a short
 # chance to settle. Pages that never go idle (polling, analytics) still get audited.
 NETWORK_IDLE_TIMEOUT_MS = 5_000
+
+
+def utc_now() -> str:
+    """Current time as an ISO 8601 UTC string (sorts correctly as text)."""
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
 class AuditError(Exception):
@@ -66,6 +72,8 @@ class AuditResult:
     # axe's "incomplete" results: possible failures axe could not decide
     # automatically (e.g. text over a background image). Need a human to check.
     needs_review: list[Finding] = field(default_factory=list)
+    # When the audit finished (UTC, ISO 8601).
+    audited_at: str = field(default_factory=utc_now)
 
     def to_dict(self) -> dict:
         return asdict(self)

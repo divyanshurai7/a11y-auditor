@@ -9,7 +9,7 @@ from collections import Counter
 
 import pytest
 
-from auditor import crawler
+from auditor import crawler, db
 from auditor.audit import AuditError, Auditor, AuditResult
 from auditor.crawler import (
     PageError,
@@ -18,6 +18,7 @@ from auditor.crawler import (
     is_page_link,
     normalize_url,
     same_site,
+    site_domain,
 )
 
 # Visit order for a full crawl of tests/fixtures/site/ starting at index.html.
@@ -267,6 +268,19 @@ def test_clean_url_keeps_path_but_drops_fragment_and_tracking():
             == "https://x.invalid/dir/?q=1")
 
 
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("https://www.Example.com/a/b?x=1", "example.com"),
+        ("http://example.com:80/", "example.com"),
+        ("http://127.0.0.1:8000/index.html", "127.0.0.1:8000"),
+        ("http://[::1]:8000/", "[::1]:8000"),
+    ],
+)
+def test_site_domain(url, expected):
+    assert site_domain(url) == expected
+
+
 def test_same_site_ignores_www():
     assert same_site("https://www.x.invalid/a", "x.invalid")
     assert same_site("http://x.invalid:8080/a", "x.invalid")
@@ -298,13 +312,15 @@ def test_is_page_link(url, expected):
 # --- command line -----------------------------------------------------------------
 
 
+def _run_cli(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run([sys.executable, "-m", "auditor.crawler", *args],
+                          capture_output=True, text=True, timeout=120)
+
+
 def test_cli_writes_json_and_prints_progress(site_server, tmp_path):
     out = tmp_path / "results.json"
-    proc = subprocess.run(
-        [sys.executable, "-m", "auditor.crawler", f"{site_server.url}/index.html",
-         "--max-pages", "2", "--delay", "0", "--output", str(out)],
-        capture_output=True, text=True, timeout=120,
-    )
+    proc = _run_cli(f"{site_server.url}/index.html", "--max-pages", "2", "--delay", "0",
+                    "--output", str(out), "--db", str(tmp_path / "a.db"))
     assert proc.returncode == 0, proc.stderr
     assert f"[1/2] {site_server.url}/index.html" in proc.stderr
     assert f"[2/2] {site_server.url}/about.html" in proc.stderr
@@ -319,14 +335,58 @@ def test_cli_writes_json_and_prints_progress(site_server, tmp_path):
 
 def test_cli_records_failed_pages_in_json(fixture_server, tmp_path):
     out = tmp_path / "results.json"
-    proc = subprocess.run(
-        [sys.executable, "-m", "auditor.crawler", f"{fixture_server}/does-not-exist.html",
-         "--delay", "0", "--output", str(out)],
-        capture_output=True, text=True, timeout=120,
-    )
+    proc = _run_cli(f"{fixture_server}/does-not-exist.html", "--delay", "0",
+                    "--output", str(out), "--db", str(tmp_path / "a.db"))
     assert proc.returncode == 1  # nothing was audited successfully
     data = json.loads(out.read_text())
-    assert data == [{"url": f"{fixture_server}/does-not-exist.html",
-                     "error": data[0]["error"]}]
+    assert len(data) == 1
+    assert data[0]["url"] == f"{fixture_server}/does-not-exist.html"
+    assert set(data[0]) == {"url", "error", "audited_at"}
     assert "404" in data[0]["error"]
     assert "404" in proc.stderr
+
+
+def test_cli_saves_each_crawl_as_a_new_run(site_server, tmp_path):
+    db_path = tmp_path / "audits.db"
+    args = [f"{site_server.url}/index.html", "--max-pages", "4", "--delay", "0",
+            "--output", str(tmp_path / "r.json"), "--db", str(db_path)]
+
+    first = _run_cli(*args)
+    assert first.returncode == 0, first.stderr
+    assert f"Saved as run 1 in {db_path}" in first.stderr
+    second = _run_cli(*args)
+    assert second.returncode == 0, second.stderr
+    assert f"Saved as run 2 in {db_path}" in second.stderr
+
+    conn = db.init_db(db_path)
+    try:
+        runs = db.get_runs(conn)
+        assert [r["id"] for r in runs] == [2, 1]
+        assert {r["domain"] for r in runs} == {site_domain(site_server.url)}
+        assert all(r["status"] == "completed" and r["max_pages"] == 4 for r in runs)
+        assert all(r["started_at"] <= r["finished_at"] for r in runs)
+
+        pages = db.get_pages(conn, 1)
+        assert [p["url"] for p in pages] == [
+            f"{site_server.url}{path}" for path in EXPECTED_PATHS[:4]
+        ]
+        assert [p["status"] for p in pages] == ["ok", "ok", "ok", "error"]
+        assert "404" in pages[3]["error_message"]
+        assert pages[0]["title"] == "Test site: home"
+        # Same pages and findings both times.
+        assert [p["url"] for p in db.get_pages(conn, 2)] == [p["url"] for p in pages]
+        assert db.rule_counts(conn, 1) == db.rule_counts(conn, 2)
+    finally:
+        conn.close()
+
+    # The JSON output is still written alongside the database.
+    assert len(json.loads((tmp_path / "r.json").read_text())) == 4
+
+
+def test_cli_reports_unwritable_db(site_server, tmp_path):
+    proc = _run_cli(f"{site_server.url}/index.html", "--max-pages", "1", "--delay", "0",
+                    "--output", str(tmp_path / "r.json"),
+                    "--db", str(tmp_path / "no-such-dir" / "a.db"))
+    assert proc.returncode == 1
+    assert "could not save" in proc.stderr
+    assert (tmp_path / "r.json").exists()  # JSON results are not lost
