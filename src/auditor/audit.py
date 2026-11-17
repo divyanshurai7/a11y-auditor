@@ -14,12 +14,19 @@ import json
 import sys
 from dataclasses import asdict, dataclass, field
 
-from axe_playwright_python.sync_playwright import Axe
+from axe_playwright_python.base import AXE_SCRIPT
 from playwright.sync_api import Error as PlaywrightError
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import Page, sync_playwright
 
 # axe-core tags for WCAG 2.0 + 2.1, levels A and AA.
 WCAG_TAGS = ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"]
+
+AXE_OPTIONS = {
+    "runOnly": {"type": "tag", "values": WCAG_TAGS},
+    # Only collect node details for these; passes/inapplicable stay summarised.
+    "resultTypes": ["violations", "incomplete"],
+    "iframes": True,
+}
 
 DEFAULT_TIMEOUT_MS = 30_000
 # After the "load" event, give late network activity (XHR, lazy assets) a short
@@ -32,27 +39,33 @@ class AuditError(Exception):
 
 
 @dataclass
-class ViolationNode:
-    """One element on the page that fails a rule."""
+class FindingNode:
+    """One element on the page that a rule flagged."""
 
     selector: str
     html: str
 
 
 @dataclass
-class Violation:
+class Finding:
+    """An axe rule that flagged one or more elements."""
+
     rule_id: str
     impact: str | None
     description: str
     help_url: str
-    nodes: list[ViolationNode] = field(default_factory=list)
+    nodes: list[FindingNode] = field(default_factory=list)
 
 
 @dataclass
 class AuditResult:
     url: str
     title: str
-    violations: list[Violation] = field(default_factory=list)
+    # Definite failures.
+    violations: list[Finding] = field(default_factory=list)
+    # axe's "incomplete" results: possible failures axe could not decide
+    # automatically (e.g. text over a background image). Need a human to check.
+    needs_review: list[Finding] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -62,44 +75,65 @@ def _selector_from_target(target: list) -> str:
     """Flatten an axe `target` into a single selector string.
 
     axe gives a list of selectors; more than one entry means the element is inside
-    iframes or shadow roots (outer -> inner). Shadow-DOM entries are themselves lists.
+    iframes (outer -> inner, joined with " | "). Shadow-DOM entries are themselves
+    lists (host -> inner, joined with " >>> ").
     """
     parts = [" >>> ".join(t) if isinstance(t, list) else str(t) for t in target]
     return " | ".join(parts)
 
 
-def _parse_violations(axe_response: dict) -> list[Violation]:
-    violations = []
-    for v in axe_response.get("violations", []):
+def _parse_findings(axe_items: list[dict]) -> list[Finding]:
+    findings = []
+    for item in axe_items:
         nodes = [
-            ViolationNode(
+            FindingNode(
                 selector=_selector_from_target(n.get("target", [])),
                 html=n.get("html", ""),
             )
-            for n in v.get("nodes", [])
+            for n in item.get("nodes", [])
         ]
-        violations.append(
-            Violation(
-                rule_id=v["id"],
-                impact=v.get("impact"),
-                description=v.get("description", ""),
-                help_url=v.get("helpUrl", ""),
+        findings.append(
+            Finding(
+                rule_id=item["id"],
+                impact=item.get("impact"),
+                description=item.get("description", ""),
+                help_url=item.get("helpUrl", ""),
                 nodes=nodes,
             )
         )
-    return violations
+    return findings
+
+
+# By default axe only exchanges results with same-origin frames. We inject axe into
+# every frame ourselves, so let it talk to cross-origin ones (third-party embeds).
+_AXE_INIT = AXE_SCRIPT + "\n;axe.configure({allowedOrigins: ['<unsafe_all_origins>']});"
+
+
+def _run_axe(page: Page) -> dict:
+    """Inject axe-core into every frame, then run it from the top-level page.
+
+    axe-core audits iframes by messaging a copy of itself inside each frame, so it
+    must be present in all of them (including cross-origin ones) before running.
+    """
+    for frame in page.frames:
+        if frame is page.main_frame:
+            continue
+        try:
+            frame.evaluate(_AXE_INIT)
+        except PlaywrightError:
+            # Frame detached or navigated away mid-injection; skip it rather than
+            # failing the whole audit.
+            pass
+    page.evaluate(_AXE_INIT)
+    return page.evaluate("options => axe.run(document, options)", AXE_OPTIONS)
 
 
 def audit_page(url: str, timeout_ms: int = DEFAULT_TIMEOUT_MS) -> AuditResult:
     """Load `url` in headless Chromium, run axe-core (WCAG 2.1 A/AA), return the result.
 
-    Raises AuditError if the page cannot be loaded or returns an HTTP error status.
+    Content inside iframes is audited too. Raises AuditError if the page cannot be
+    loaded or returns an HTTP error status.
     """
-    axe = Axe()
-    options = {
-        "runOnly": {"type": "tag", "values": WCAG_TAGS},
-        "resultTypes": ["violations"],
-    }
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
@@ -114,7 +148,7 @@ def audit_page(url: str, timeout_ms: int = DEFAULT_TIMEOUT_MS) -> AuditResult:
                     pass  # never went idle; audit what's there
                 title = page.title()
                 final_url = page.url
-                results = axe.run(page, options=options)
+                axe_response = _run_axe(page)
             finally:
                 browser.close()
     except PlaywrightError as exc:
@@ -123,7 +157,8 @@ def audit_page(url: str, timeout_ms: int = DEFAULT_TIMEOUT_MS) -> AuditResult:
     return AuditResult(
         url=final_url,
         title=title,
-        violations=_parse_violations(results.response),
+        violations=_parse_findings(axe_response.get("violations", [])),
+        needs_review=_parse_findings(axe_response.get("incomplete", [])),
     )
 
 

@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Page with a cross-origin iframe</title>
+</head>
+<body>
+  <main>
+    <h1>The problem is inside a cross-origin iframe</h1>
+    <iframe id="widget" title="Embedded widget"></iframe>
+  </main>
+  <script>
+    // Load the child from a different origin (localhost vs 127.0.0.1, same
+    // local test server), like a third-party embed on a real site.
+    var src = location.href.replace("127.0.0.1", "localhost")
+                           .replace("iframe_cross_origin.html", "iframe_child.html");
+    document.getElementById("widget").src = src;
+  </script>
+</body>
+</html>

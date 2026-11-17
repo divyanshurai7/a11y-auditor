@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Text over a background image</title>
+  <style>
+    body { color: #222; background: #fff; font-family: sans-serif; }
+    /* PLANTED: text over a gradient background. axe can't compute a single
+       contrast ratio, so it reports "color-contrast" as needs-review, not a violation. */
+    .hero {
+      background-image: linear-gradient(to right, #fff, #777);
+      color: #555;
+      padding: 1em;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Planted problem: contrast axe can't decide</h1>
+    <p id="hero-text" class="hero">Is this text readable over the gradient?</p>
+  </main>
+</body>
+</html>
