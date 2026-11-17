@@ -22,7 +22,7 @@ src/auditor/
   db.py        # SQLite persistence
   api.py       # FastAPI app + Jinja2 templates
 tests/
-  pages/       # local static HTML fixtures used by tests
+  fixtures/    # local static HTML fixtures used by tests
   test_*.py
 ```
 
@@ -37,7 +37,7 @@ tests/
 ## Rules
 
 - **Every feature gets pytest tests.** No feature is done without tests covering it.
-- **Tests never hit live websites.** Use the HTML fixtures in `tests/pages/`, served locally (e.g. a local HTTP server fixture) or loaded from `file://`. Mock any network access that would otherwise go external.
+- **Tests never hit live websites.** Use the HTML fixtures in `tests/fixtures/`, served locally (e.g. a local HTTP server fixture) or loaded from `file://`. Mock any network access that would otherwise go external.
 - **Crawler etiquette:**
   - Respect `robots.txt` (stdlib `urllib.robotparser`).
   - Stay on the same domain as the start URL.

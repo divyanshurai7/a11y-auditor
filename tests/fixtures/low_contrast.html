@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Low-contrast text</title>
+  <style>
+    body { color: #222; background: #fff; font-family: sans-serif; }
+    /* PLANTED: #bbb on #fff is ~1.9:1, well below the 4.5:1 AA minimum -> "color-contrast" */
+    .faint { color: #bbb; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Planted problem: low-contrast text</h1>
+    <p id="faint-text" class="faint">This light grey text is hard to read.</p>
+  </main>
+</body>
+</html>

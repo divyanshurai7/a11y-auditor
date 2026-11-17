@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Form input without a label</title>
+</head>
+<body>
+  <main>
+    <h1>Planted problem: form input without a label</h1>
+    <form>
+      <!-- PLANTED: no <label>, aria-label, or title -> axe rule "label" -->
+      <input id="unlabelled" type="text" name="name">
+      <button type="submit">Send</button>
+    </form>
+  </main>
+</body>
+</html>
