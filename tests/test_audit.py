@@ -8,7 +8,13 @@ import sys
 
 import pytest
 
-from auditor.audit import AuditError, AuditResult, _selector_from_target, audit_page
+from auditor.audit import (
+    AuditError,
+    Auditor,
+    AuditResult,
+    _selector_from_target,
+    audit_page,
+)
 
 
 def _violation(result: AuditResult, rule_id: str):
@@ -121,3 +127,29 @@ def test_cli_reports_errors_on_stderr(fixture_server):
     assert proc.returncode == 1
     assert proc.stdout == ""
     assert "404" in proc.stderr
+
+
+# --- Auditor (reusable browser) ----------------------------------------------
+
+
+def test_auditor_audits_several_pages(fixture_server):
+    with Auditor() as auditor:
+        clean = auditor.audit(f"{fixture_server}/clean.html")
+        bad = auditor.audit(f"{fixture_server}/missing_alt.html")
+    assert clean.violations == []
+    assert [v.rule_id for v in bad.violations] == ["image-alt"]
+
+
+def test_auditor_fetch_text(fixture_server):
+    with Auditor() as auditor:
+        status, body = auditor.fetch_text(f"{fixture_server}/clean.html")
+        missing_status, _ = auditor.fetch_text(f"{fixture_server}/robots.txt")
+    assert status == 200
+    assert "<title>Clean page</title>" in body
+    assert missing_status == 404
+
+
+def test_auditor_fetch_text_unreachable_raises():
+    with Auditor(timeout_ms=5_000) as auditor:
+        with pytest.raises(AuditError):
+            auditor.fetch_text("http://127.0.0.1:9/robots.txt")

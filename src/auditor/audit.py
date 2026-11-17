@@ -128,18 +128,100 @@ def _run_axe(page: Page) -> dict:
     return page.evaluate("options => axe.run(document, options)", AXE_OPTIONS)
 
 
-def audit_page(url: str, timeout_ms: int = DEFAULT_TIMEOUT_MS) -> AuditResult:
-    """Load `url` in headless Chromium, run axe-core (WCAG 2.1 A/AA), return the result.
+class Auditor:
+    """A reusable headless Chromium for auditing many pages with one browser.
 
-    Content inside iframes is audited too. Raises AuditError if the page cannot be
-    loaded or returns an HTTP error status.
+    Use as a context manager::
+
+        with Auditor() as auditor:
+            for url in urls:
+                result = auditor.audit(url)
+
+    Each page gets a fresh browser context (no cookies or storage carried over).
     """
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+
+    def __init__(self, timeout_ms: int = DEFAULT_TIMEOUT_MS) -> None:
+        self.timeout_ms = timeout_ms
+        self._playwright = None
+        self._browser = None
+        self._request_context = None
+
+    def __enter__(self) -> "Auditor":
+        self.start()
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self.close()
+
+    def start(self) -> None:
+        try:
+            self._playwright = sync_playwright().start()
+            self._browser = self._launch()
+        except PlaywrightError as exc:
+            self.close()
+            raise AuditError(f"Failed to start browser: {exc}") from exc
+
+    def close(self) -> None:
+        if self._request_context is not None:
             try:
-                page = browser.new_page()
-                response = page.goto(url, wait_until="load", timeout=timeout_ms)
+                self._request_context.dispose()
+            except PlaywrightError:
+                pass
+            self._request_context = None
+        if self._browser is not None:
+            try:
+                self._browser.close()
+            except PlaywrightError:
+                pass
+            self._browser = None
+        if self._playwright is not None:
+            self._playwright.stop()
+            self._playwright = None
+
+    def _launch(self):
+        return self._playwright.chromium.launch(headless=True)
+
+    def fetch_text(self, url: str, headers: dict[str, str] | None = None) -> tuple[int, str]:
+        """Plain HTTP GET (no page rendering); returns (status, body text).
+
+        Goes through Playwright's networking rather than Python's urllib, so TLS
+        verification doesn't depend on how Python's certificates are set up.
+        Follows redirects. Raises AuditError if the server can't be reached.
+        """
+        if self._playwright is None:
+            raise RuntimeError("Auditor is not started; use it as a context manager")
+        try:
+            if self._request_context is None:
+                self._request_context = self._playwright.request.new_context()
+            response = self._request_context.get(
+                url, headers=headers, timeout=self.timeout_ms, fail_on_status_code=False
+            )
+            try:
+                return response.status, response.text()
+            finally:
+                response.dispose()
+        except PlaywrightError as exc:
+            raise AuditError(f"Failed to fetch {url}: {exc}") from exc
+
+    def audit(self, url: str) -> AuditResult:
+        """Audit one page. Raises AuditError if it can't be loaded or audited."""
+        return self.audit_with_links(url)[0]
+
+    def audit_with_links(self, url: str) -> tuple[AuditResult, list[str]]:
+        """Audit one page and also return the absolute URLs of its links.
+
+        Links are read from the rendered DOM (after JavaScript has run), so links
+        added by scripts are included.
+        """
+        if self._playwright is None:
+            raise RuntimeError("Auditor is not started; use it as a context manager")
+        try:
+            if self._browser is None or not self._browser.is_connected():
+                self._browser = self._launch()  # recover from a browser crash
+            context = self._browser.new_context()
+            try:
+                page = context.new_page()
+                response = page.goto(url, wait_until="load", timeout=self.timeout_ms)
                 if response is not None and response.status >= 400:
                     raise AuditError(f"{url} returned HTTP {response.status}")
                 try:
@@ -149,17 +231,34 @@ def audit_page(url: str, timeout_ms: int = DEFAULT_TIMEOUT_MS) -> AuditResult:
                 title = page.title()
                 final_url = page.url
                 axe_response = _run_axe(page)
+                links = page.eval_on_selector_all(
+                    "a[href], area[href]",
+                    # SVG <a> elements have a non-string .href; skip them.
+                    "els => els.map(e => e.href).filter(h => typeof h === 'string')",
+                )
             finally:
-                browser.close()
-    except PlaywrightError as exc:
-        raise AuditError(f"Failed to audit {url}: {exc}") from exc
+                context.close()
+        except PlaywrightError as exc:
+            raise AuditError(f"Failed to audit {url}: {exc}") from exc
 
-    return AuditResult(
-        url=final_url,
-        title=title,
-        violations=_parse_findings(axe_response.get("violations", [])),
-        needs_review=_parse_findings(axe_response.get("incomplete", [])),
-    )
+        result = AuditResult(
+            url=final_url,
+            title=title,
+            violations=_parse_findings(axe_response.get("violations", [])),
+            needs_review=_parse_findings(axe_response.get("incomplete", [])),
+        )
+        return result, links
+
+
+def audit_page(url: str, timeout_ms: int = DEFAULT_TIMEOUT_MS) -> AuditResult:
+    """Load `url` in headless Chromium, run axe-core (WCAG 2.1 A/AA), return the result.
+
+    Content inside iframes is audited too. Raises AuditError if the page cannot be
+    loaded or returns an HTTP error status. Launches its own browser; to audit many
+    pages, use an `Auditor` instead.
+    """
+    with Auditor(timeout_ms=timeout_ms) as auditor:
+        return auditor.audit(url)
 
 
 def main(argv: list[str] | None = None) -> int:

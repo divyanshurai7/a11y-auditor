@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Test site: products</title>
+</head>
+<body>
+  <main>
+    <h1>Products</h1>
+    <p id="links"><a href="../about.html">About</a></p>
+  </main>
+  <script>
+    // The contact page is only linked from here, and only after JavaScript runs:
+    // a crawler reading the raw HTML would never find it.
+    var a = document.createElement("a");
+    a.href = "../contact.html";
+    a.textContent = "Contact";
+    document.getElementById("links").append(" ", a);
+  </script>
+</body>
+</html>
