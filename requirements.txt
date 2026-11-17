@@ -1,0 +1,12 @@
+# Browser automation + accessibility engine
+playwright==1.65.2
+axe-playwright-python==0.1.8
+
+# Web app
+fastapi==0.163.1
+uvicorn==0.54.0
+jinja2==3.1.6
+
+# Testing
+pytest==9.2.0
+httpx==0.28.1  # required by fastapi.testclient

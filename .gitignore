@@ -1,0 +1,17 @@
+# Virtualenv
+.venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Data
+*.db
+*.sqlite3
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
